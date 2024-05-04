@@ -263,6 +263,7 @@ def predict_data(combined_feature):
 # get the raw data from the ESP32, extract FFT features, and
 # A: store the data in the blob (Azure storage) if the record state is True
 # B: call the model to predict the data if the record state is False
+# req json format: {"piezo": [1332, 2233, 3231, ...], "mic": [1234, 2452, 3133, ...]}
 @app.function_name("esp_rawdata_process")
 @app.route(route="esp_rawdata_process")
 def esp_rawdata_process(req: func.HttpRequest) -> func.HttpResponse:
