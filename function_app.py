@@ -275,6 +275,21 @@ def esp_rawdata_process(req: func.HttpRequest) -> func.HttpResponse:
         piezo_raw = req_body.get('piezo', [])
         mic_raw = req_body.get('mic', [])
 
+        # the target length for both data is 3000 (~0.5s)
+        target_length = 3000
+        if len(piezo_raw) < target_length:
+            # repeat the final value to fill the array
+            piezo_raw.extend([piezo_raw[-1]] * (target_length - len(piezo_raw)))
+        elif len(piezo_raw) > target_length:
+            # truncate the array
+            piezo_raw = piezo_raw[:target_length]
+        if len(mic_raw) < target_length:
+            # repeat the final value to fill the array
+            mic_raw.extend([mic_raw[-1]] * (target_length - len(mic_raw)))
+        elif len(mic_raw) > target_length:
+            # truncate the array
+            mic_raw = mic_raw[:target_length]
+
         # convert the data to numpy arrays
         piezo_npArr = np.array(piezo_raw)
         mic_npArr = np.array(mic_raw)
