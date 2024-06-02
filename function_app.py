@@ -16,6 +16,7 @@ import io
 import os
 import json
 from dotenv import load_dotenv
+import requests
 # from azureml.core import Workspace, Model
 # from azureml.core.webservice import AciWebservice, Webservice
 # from azureml.core.model import InferenceConfig
@@ -36,6 +37,41 @@ def get_env_variables():
     except Exception as e:
         print("Error reading state:", e)
         return None, None  # return None if there is an error
+
+# read the mapping table to get the Blynk token and virtual pin
+# the "prediction" gesture control which virtual pin?
+def read_mapping_table(prediction):
+    connection_string = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+    table_service_client = TableServiceClient.from_connection_string(connection_string)
+    table_client = table_service_client.get_table_client("envVariables")
+    try:
+        entity = table_client.get_entity(partition_key="map", row_key=prediction)
+        return entity['blynkToken'], entity['virtualPin']
+    except Exception as e:
+        print("Error reading mapping table:", e)
+        return None, None
+    
+# get the value of the virtual pin
+def get_virtual_pin_status(token, pin):
+    url = f"https://blynk.cloud/external/api/get?token={token}&V{pin}"
+    response = requests.get(url)
+    if response.status_code == 200:
+        return int(response.text)
+    else:
+        print(f"Failed to get the value of {pin}. Status Code: {response.status_code}")
+        return None
+
+# update the value of the virtual pin
+def update_virtual_pin_status(token, pin, value):
+    url = f"https://blynk.cloud/external/api/update?token={token}&V{pin}={value}"
+    response = requests.get(url)
+    # print the url
+    print(f"update url: {url}")
+    if response.status_code == 200:
+        return response.text
+    else:
+        print(f"Failed to update the value of {pin}. Status Code: {response.status_code}")
+        return None
 
 # update the record state in the table
 def update_env_variables(record_state, label, data_count):
@@ -182,7 +218,7 @@ def train_model(req: func.HttpRequest) -> func.HttpResponse:
         features_scaled = scaler.fit_transform(features_array)
         
         # 划分训练集和测试集
-        X_train, X_test, y_train, y_test = train_test_split(features_scaled, labels, test_size=0.2, random_state=42)
+        X_train, X_test, y_train, y_test = train_test_split(features_scaled, labels, test_size=0.25, random_state=42)
 
         # 训练随机森林模型
         model = RandomForestClassifier(n_estimators=100, random_state=42)
@@ -218,8 +254,8 @@ def train_model(req: func.HttpRequest) -> func.HttpResponse:
         model_report_blob_client = model_container_client.get_blob_client("model_report.json")
         model_report_blob_client.upload_blob(json.dumps(model_report), overwrite=True)
 
-
-        return func.HttpResponse(f"Model and scaler uploaded successfully. Model trained successfully with {len(X_train)} training samples and {len(X_test)}. Test accuracy: {accuracy:.2f}", status_code=200)
+        # return func.HttpResponse(f"Success. Model trained successfully with {len(X_train)} training samples and {len(X_test)} test samples. Test accuracy: {accuracy:.2f}", status_code=200)
+        return func.HttpResponse(f"Success. Accuracy: {accuracy:.2f}", status_code=200)
     
     except Exception as e:
         return func.HttpResponse(f"Error: {str(e)}", status_code=500)
@@ -253,8 +289,35 @@ def predict_data(combined_feature):
         combined_feature_scaled = scaler.transform([combined_feature])  # 假设combined_feature是单个样本
 
         # 使用模型预测
+        # prediction = model.predict(combined_feature_scaled)
+        # return prediction[0]  # 返回预测结果
+        threshold = 0
+        probas = model.predict_proba(combined_feature_scaled)[0]
+
+        max_proba = np.max(probas) # max_proba = np.max(probas, axis=0)
         prediction = model.predict(combined_feature_scaled)
-        return prediction[0]  # 返回预测结果
+
+        # map label to probability
+        label_proba_dict = dict(zip(model.classes_, probas))
+
+        print(f"Predictions: {prediction}, Label-Proba Dict: {label_proba_dict}")
+
+
+        if max_proba >= threshold:
+            return prediction[0], label_proba_dict
+        else:
+            return "None", label_proba_dict
+
+        # results = []
+        # for pred, max_proba, proba in zip(predictions, max_probas, probas):
+        #     if max_proba >= threshold:
+        #         result = (pred, max_proba, proba)
+        #     else:
+        #         result = ("None", max_proba, proba)
+        #     results.append(result)
+        #     print(f"Prediction: {result[0]}, Max Proba: {result[1]:.4f}, All Probas: {result[2]}")
+        # return [result[0] for result in results]
+
 
     except Exception as e:
         print(f"Error: {str(e)}")
@@ -275,6 +338,8 @@ def esp_rawdata_process(req: func.HttpRequest) -> func.HttpResponse:
         piezo_raw = req_body.get('piezo', [])
         mic_raw = req_body.get('mic', [])
 
+        print(f"Raw piezo length: {len(piezo_raw)}, Raw mic length: {len(mic_raw)}")
+
         # the target length for both data is 3000 (~0.5s)
         target_length = 3000
         if len(piezo_raw) < target_length:
@@ -290,31 +355,72 @@ def esp_rawdata_process(req: func.HttpRequest) -> func.HttpResponse:
             # truncate the array
             mic_raw = mic_raw[:target_length]
 
+        # should have the same length of 3000 for both arrays
+       
         # convert the data to numpy arrays
         piezo_npArr = np.array(piezo_raw)
         mic_npArr = np.array(mic_raw)
 
+        # Debug: Check for NaN values in numpy arrays
+        if np.isnan(piezo_npArr).any() or np.isnan(mic_npArr).any():
+            print("NaN values found in raw data arrays")
+            return func.HttpResponse(
+                "Invalid data: NaN values present",
+                status_code=400
+            )
+        
+        print(f"piezo_npArr: {piezo_npArr[:100]}, mic_npArr: {mic_npArr[:50]}")
+        
+
         # denoise the piezo and mic data
-        piezo_denoised = wavelet_denoise(piezo_npArr, 'db1', 5) # 这里使用了Daubechies小波（'db1'），也就是Haar小波，分解层数为1。
-        mic_denoised = wavelet_denoise(mic_npArr, 'db1', 5)
+        piezo_denoised = wavelet_denoise(piezo_npArr, 'db2', 2) # 这里使用了Daubechies小波（'db1'），也就是Haar小波，分解层数为1。
+        mic_denoised = wavelet_denoise(mic_npArr, 'db2', 2)
+        
+        # Debug: Check denoised data
+        print(f"Denoised piezo: {piezo_denoised[:100]}, Denoised mic: {mic_denoised[:50]}")
+
+        # 检查降噪数据中的无限值
+        if np.isinf(piezo_denoised).any() or np.isinf(mic_denoised).any():
+            print("Infinite values found in denoised data arrays")
+            return func.HttpResponse(
+                "Invalid data: Infinite values present in denoised data",
+                status_code=400
+            )
         
         # fft the piezo and mic data
         piezo_fft = np.fft.fft(piezo_denoised)
         mic_fft = np.fft.fft(mic_denoised)
 
-        # extract features from the fft results
-        piezo_spectral_feature = fft_features(piezo_fft)
-        piezo_spectral_feature = np.array(list(piezo_spectral_feature.values()))
-        piezo_wavelet_feature = wavelet_features(piezo_denoised)['wavelet_energy']
-        piezo_feature = np.concatenate((piezo_spectral_feature, piezo_wavelet_feature))
+        # debug: check the fft results
+        print(f"FFT piezo: {piezo_fft[:100]}, FFT mic: {mic_fft[:10]}")
 
-        mic_spectral_feature = fft_features(mic_fft)
-        mic_spectral_feature = np.array(list(mic_spectral_feature.values()))
-        mic_wavelet_feature = wavelet_features(mic_denoised)['wavelet_energy']
-        mic_feature = np.concatenate((mic_spectral_feature, mic_wavelet_feature))
+        # Check for NaN values in FFT results
+        if np.isnan(piezo_fft).any() or np.isnan(mic_fft).any():
+            print("NaN values found in FFT results")
+            return func.HttpResponse(
+                "Invalid data: NaN values present in FFT results",
+                status_code=400
+            )
+
+        # extract features from the fft results
+        # piezo_spectral_feature = fft_features(piezo_fft)
+        # piezo_spectral_feature = np.array(list(piezo_spectral_feature.values()))
+        # piezo_wavelet_feature = wavelet_features(piezo_denoised)['wavelet_energy']
+        # piezo_feature = np.concatenate((piezo_spectral_feature, piezo_wavelet_feature))
+        piezo_feature = np.abs(piezo_fft)
+
+        # mic_spectral_feature = fft_features(mic_fft)
+        # mic_spectral_feature = np.array(list(mic_spectral_feature.values()))
+        # mic_wavelet_feature = wavelet_features(mic_denoised)['wavelet_energy']
+        # mic_feature = np.concatenate((mic_spectral_feature, mic_wavelet_feature))
+        mic_feature = np.abs(mic_fft)
+
+        print(f"FFT piezo feature: {piezo_feature[:10]}, FFT mic feature: {mic_feature[:10]}")
 
         # combine the features
         combined_feature = np.concatenate((piezo_feature, mic_feature))
+
+        print(f"Combined feature: {combined_feature[:10]}")
 
         # get the record state
         record_state, label, data_count = get_env_variables()
@@ -328,12 +434,26 @@ def esp_rawdata_process(req: func.HttpRequest) -> func.HttpResponse:
                 mimetype="application/json"
             )
         else: # if the record state is False, call the model to predict the data
-            prediction = predict_data(combined_feature)
+            prediction, label_proba_dict = predict_data(combined_feature)
 
-            # 🌟🌟🌟🌟 [placeholder] after making the prediction, read the mapping table, find the according HTTP API to call under this prediction value
+            # Read the mapping table to get Blynk token and virtual pin
+            blynkToken, virtualPin = read_mapping_table(prediction)
+
+            if blynkToken and virtualPin:
+                # Get the current status of the virtual pin
+                current_status = get_virtual_pin_status(blynkToken, virtualPin)
+
+                if current_status is not None:
+                    # Determine the new value based on the current status
+                    new_value = 0 if current_status else 255
+                    # Update the virtual pin status
+                    update_virtual_pin_status(blynkToken, virtualPin, new_value)
+            
+            # print the prediction
+            print(f"Prediction: {prediction}")
             
             return func.HttpResponse(
-                body=json.dumps({"prediction": prediction}),
+                body=json.dumps({"prediction": prediction, "label_proba_dict": label_proba_dict}),
                 status_code=200,
                 mimetype="application/json"
             )

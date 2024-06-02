@@ -8,6 +8,6 @@ PyWavelets
 scipy
 azure.data.tables
 azure-storage-blob
-scikit-learn
+scikit-learn==1.5.0
 joblib
 python-dotenv
